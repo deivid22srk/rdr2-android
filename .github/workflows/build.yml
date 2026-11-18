@@ -1,0 +1,173 @@
+name: build
+
+# Two modes, chosen by the repository variable GEN_REPO and by a manual run:
+#
+#   shell  (default, runs on every push)
+#          Builds an APK that contains no game code. Safe to publish as a public
+#          artifact. It is the launcher + Vulkan capability probe.
+#
+#   full   (workflow_dispatch only, owner only, GEN_REPO set)
+#          Downloads codegen.tar.zst from the *private* repository GEN_REPO,
+#          builds the APK with the recompiled game objects, and publishes it as
+#          an asset of a *private* release there. Never uploaded here.
+#
+# gen/ is derived from the user's own copy of the game. It must never be
+# committed to this repository, uploaded as a public artifact or attached to a
+# release here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "shell = sem código do jogo | full = com codegen privado"
+        type: choice
+        options: [shell, full]
+        default: shell
+      gen_jobs:
+        description: "Compilações paralelas do codegen (cada uma usa ~1.5 GB de RAM)"
+        required: false
+        default: "3"
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}-${{ github.event.inputs.variant || 'shell' }}
+  cancel-in-progress: true
+
+jobs:
+  leak-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verificar que nenhum material do jogo entrou no repositório
+        run: ./scripts/leak_check.sh
+
+  apk:
+    runs-on: ubuntu-latest
+    needs: leak-check
+    # The full build compiles ~1.5-2 GB of generated C at -O1 in a few jobs;
+    # keep a wide margin under the 6 h job limit.
+    timeout-minutes: 350
+    env:
+      VARIANT: ${{ github.event.inputs.variant || 'shell' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Liberar espaço em disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/lib/android/sdk/ndk/2[0-6].* || true
+          df -h /
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: >-
+            platforms;android-34
+            build-tools;34.0.0
+            cmake;3.22.1
+            ndk;27.2.12479018
+
+      - name: Versões da toolchain
+        run: |
+          java -version
+          ls "$ANDROID_HOME/ndk"
+          cmake --version | head -1
+          free -m
+          df -h /
+
+      - name: Baixar codegen do repositório privado
+        if: env.VARIANT == 'full'
+        env:
+          GH_TOKEN: ${{ secrets.GEN_TOKEN }}
+          GEN_REPO: ${{ vars.GEN_REPO }}
+          GEN_TAG: ${{ vars.GEN_TAG }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REPOSITORY_OWNER" != "deivid22srk" ]; then
+            echo "::error::build full só roda para o dono do repositório"; exit 1
+          fi
+          test -n "${GEN_REPO:-}" || { echo "::error::variável GEN_REPO não configurada"; exit 1; }
+          test -n "${GH_TOKEN:-}"  || { echo "::error::segredo GEN_TOKEN ausente"; exit 1; }
+          echo "baixando $GEN_TAG de $GEN_REPO"
+          gh release download "$GEN_TAG" --repo "$GEN_REPO" \
+            --pattern 'codegen.tar.zst' --output codegen.tar.zst --clobber
+          ls -l codegen.tar.zst
+          tar --use-compress-program=unzstd -xf codegen.tar.zst
+          rm -f codegen.tar.zst
+          echo "arquivos de codegen: $(ls gen/*.c 2>/dev/null | wc -l)"
+          du -sh gen
+
+      - name: Exigir codegen no build full
+        if: env.VARIANT == 'full'
+        run: |
+          if [ -z "$(ls -A gen 2>/dev/null)" ]; then
+            echo "::error::build full sem gen/ — o codegen não foi baixado"; exit 1
+          fi
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build APK
+        working-directory: android
+        env:
+          GEN_JOBS: ${{ github.event.inputs.gen_jobs || '3' }}
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug \
+            -PndkVersion=27.2.12479018 \
+            -Prdr2GenJobs="${GEN_JOBS}"
+          ls -l app/build/outputs/apk/debug/
+
+      - name: Coletar artefato
+        run: |
+          mkdir -p out
+          cp android/app/build/outputs/apk/debug/app-debug.apk "out/RDR2-$VARIANT.apk"
+          sha256sum "out/RDR2-$VARIANT.apk" | tee "out/RDR2-$VARIANT.apk.sha256"
+          ls -l out
+
+      # Full APK: never an artifact of this public repository.
+      - name: Publicar APK full na release do repositório privado
+        if: env.VARIANT == 'full'
+        env:
+          GH_TOKEN: ${{ secrets.GEN_TOKEN }}
+          GEN_REPO: ${{ vars.GEN_REPO }}
+        run: |
+          set -euo pipefail
+          tag="apk-${GITHUB_RUN_NUMBER}-$(date -u +%Y%m%d-%H%M)"
+          sha="$(cut -d' ' -f1 out/RDR2-full.apk.sha256)"
+          gh release create "$tag" out/RDR2-full.apk \
+            --repo "$GEN_REPO" \
+            --title "APK $tag" \
+            --notes "Compilado em ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          sha256: $sha
+          Contém código do jogo. Não redistribuir."
+          {
+            echo "### APK full compilado"
+            echo ""
+            echo "Download: https://github.com/$GEN_REPO/releases/tag/$tag"
+            echo ""
+            echo "sha256: \`$sha\`"
+            echo ""
+            echo "É uma release **privada** de propósito: o APK contém o código do jogo recompilado."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Shell APK: no game code, safe to publish here.
+      - uses: actions/upload-artifact@v4
+        if: env.VARIANT == 'shell'
+        with:
+          name: rdr2-android-shell
+          path: |
+            out/RDR2-shell.apk
+            out/RDR2-shell.apk.sha256
+          retention-days: 14
+          if-no-files-found: error

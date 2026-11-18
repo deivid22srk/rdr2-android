@@ -1,0 +1,2 @@
+rootProject.name = 'RDR2_Android'
+include ':app'

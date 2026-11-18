@@ -1,0 +1,67 @@
+apply plugin: 'com.android.application'
+
+/* Release signing: no key in the repository. CI passes a throwaway debug key
+ * unless KEYSTORE_BASE64 and friends are configured. */
+def ks = System.getenv("RDR2_KEYSTORE") ?: project.findProperty("rdr2Keystore")
+def ksType = System.getenv("RDR2_KEYSTORE_TYPE") ?: "PKCS12"
+def ksPass = System.getenv("RDR2_STORE_PASSWORD") ?: project.findProperty("rdr2StorePassword")
+def keyAlias = System.getenv("RDR2_KEY_ALIAS") ?: project.findProperty("rdr2KeyAlias")
+def keyPass = System.getenv("RDR2_KEY_PASSWORD") ?: project.findProperty("rdr2KeyPassword")
+
+android {
+    namespace "com.deivid22srk.rdr2"
+    compileSdkVersion 34
+    ndkVersion project.hasProperty('ndkVersion') ? project.property('ndkVersion') : null
+
+    defaultConfig {
+        applicationId "com.deivid22srk.rdr2"
+        // Vulkan 1.1 is required by the game's Vulkan backend.
+        minSdkVersion 29
+        targetSdkVersion 34
+        versionCode project.hasProperty('rdr2VersionCode') ? project.property('rdr2VersionCode').toInteger() : 1
+        versionName project.hasProperty('rdr2VersionName') ? project.property('rdr2VersionName') : "0.1"
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_PLATFORM=android-29",
+                        "-DRDR2_GEN_JOBS=" + (project.findProperty('rdr2GenJobs') ?: '3')
+                abiFilters 'arm64-v8a'
+            }
+        }
+    }
+    signingConfigs {
+        if (ks) {
+            release {
+                storeFile file(ks)
+                storeType ksType
+                storePassword ksPass
+                keyAlias keyAlias
+                keyPassword keyPass
+            }
+        }
+    }
+    buildTypes {
+        debug {
+            externalNativeBuild { cmake { arguments "-DCMAKE_BUILD_TYPE=Release" } }
+            debuggable true
+            jniDebuggable false
+        }
+        release {
+            minifyEnabled false
+            signingConfig ks ? signingConfigs.release : signingConfigs.debug
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path 'jni/CMakeLists.txt'
+            version '3.22.1'
+        }
+    }
+    packagingOptions {
+        jniLibs { useLegacyPackaging true }
+    }
+    lint { abortOnError false }
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+}

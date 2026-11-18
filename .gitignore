@@ -1,0 +1,40 @@
+# Nada derivado do jogo entra neste repositório público.
+*.exe
+*.dll
+*.sys
+*.pdb
+*.rpf
+*.ytd
+*.ymt
+*.yft
+*.awc
+*.bik
+*.bk2
+
+# A cópia do jogo do usuário e o código gerado a partir dela.
+game/
+Crack/
+crack/
+gen/
+codegen/
+work/
+analysis/
+*.tar.zst
+
+# Compilação
+build/
+.gradle/
+local.properties
+.cxx/
+*.o
+*.a
+*.so
+*.apk
+*.aab
+*.keystore
+*.jks
+
+# Diversos
+__pycache__/
+*.pyc
+.DS_Store
