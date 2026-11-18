@@ -117,7 +117,6 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
 
       - name: Build APK
-        working-directory: android
         env:
           GEN_JOBS: ${{ github.event.inputs.gen_jobs || '3' }}
         run: |
@@ -130,7 +129,7 @@ jobs:
       - name: Coletar artefato
         run: |
           mkdir -p out
-          cp android/app/build/outputs/apk/debug/app-debug.apk "out/RDR2-$VARIANT.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "out/RDR2-$VARIANT.apk"
           sha256sum "out/RDR2-$VARIANT.apk" | tee "out/RDR2-$VARIANT.apk.sha256"
           ls -l out
 
