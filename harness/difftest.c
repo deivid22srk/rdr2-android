@@ -1,3 +1,4 @@
+#define _GNU_SOURCE 1
 /* Differential test: original x86-64 function vs the C the lifter generated.
  *
  * Both run on the same host CPU. The original is called through harness/trampoline.S with a
@@ -18,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #include "x64rt.h"
@@ -32,9 +34,12 @@ static uint64_t g_base;
 static sigjmp_buf g_jb;
 static volatile int g_crashed;
 
+static volatile unsigned long long g_fault_addr, g_fault_pc;
 static void on_segv(int sig, siginfo_t *si, void *uc)
 {
-    (void)sig; (void)si; (void)uc;
+    (void)sig;
+    g_fault_addr = (unsigned long long)(uintptr_t)si->si_addr;
+    g_fault_pc = (unsigned long long)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
     g_crashed = 1;
     siglongjmp(g_jb, 1);
 }
@@ -59,7 +64,7 @@ static int map_image(const char *path)
     uint64_t *opt = (uint64_t *)(buf + pe + 24);
 
     g_base = base;
-    g_image = mmap((void *)(uintptr_t)base, imgsz, PROT_READ | PROT_WRITE,
+    g_image = mmap((void *)(uintptr_t)base, imgsz, PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
     if (g_image == MAP_FAILED) { perror("mmap image"); return -1; }
     memcpy(g_image, buf, (size_t)(optsz + 24 + (uint64_t)pe));
@@ -101,11 +106,21 @@ static uint64_t interesting(void)
     }
 }
 
+#define ARENA_BASE 0x300000000ull
+#define ARENA_SIZE 0x200000ull
+
+static uint8_t *g_arena;
+
 static void fill_ctx(X64Ctx *c, uint8_t *stack, size_t stack_size, uint64_t fn_addr)
 {
     memset(c, 0, sizeof *c);
     for (int i = 0; i < 16; i++)
-        if (i != 4) c->r[i] = interesting();
+        if (i != 4)
+            /* Half the time a pointer into the arena, half the time a value that hits an
+             * arithmetic edge case. */
+            c->r[i] = (rnd() & 1)
+                          ? (ARENA_BASE + (rnd() & (ARENA_SIZE - 0x2000)))
+                          : interesting();
     for (int i = 0; i < 16; i++) {
         c->xmm[i][0] = rnd();
         c->xmm[i][1] = rnd();
@@ -162,6 +177,20 @@ int main(int argc, char **argv)
     size_t stack_size = 1 << 16;
     uint8_t *stack = malloc(stack_size);
     if (!stack) return 2;
+    /* Both versions must start from the same stack image: a function that reads a stack
+     * slot it never wrote (an argument the caller never placed, a local it skipped) would
+     * otherwise see whatever the previous run left there. */
+    uint8_t *stack_image = malloc(stack_size);
+    if (!stack_image) return 2;
+    for (size_t i = 0; i < stack_size; i += 8)
+        *(uint64_t *)(stack + i) = rnd();
+    memcpy(stack_image, stack, stack_size);
+
+    g_arena = mmap((void *)(uintptr_t)ARENA_BASE, ARENA_SIZE, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (g_arena == MAP_FAILED) { perror("mmap arena"); return 2; }
+    for (size_t i = 0; i < ARENA_SIZE; i += 8)
+        *(uint64_t *)(g_arena + i) = rnd();
 
     int funcs = 0, oks = 0, mismatches = 0, both_crash = 0, only_one_crash = 0, skipped = 0;
     X64Ctx *a = malloc(sizeof *a), *b = malloc(sizeof *b);
@@ -175,6 +204,7 @@ int main(int argc, char **argv)
         funcs++;
         int bad = 0;
         for (int k = 0; k < cases; k++) {
+            memcpy(stack, stack_image, stack_size);
             fill_ctx(a, stack, stack_size, addr);
             memcpy(b, a, sizeof *b);
 
@@ -187,6 +217,7 @@ int main(int argc, char **argv)
             }
             uint64_t after_a_rsp = a->r[4];
 
+            memcpy(stack, stack_image, stack_size);
             g_crashed = 0;
             int crashed_b = 0;
             if (sigsetjmp(g_jb, 1) == 0) {
@@ -196,7 +227,13 @@ int main(int argc, char **argv)
             }
             (void)after_a_rsp;
 
-            if (crashed_a != crashed_b) { only_one_crash++; bad = 1; break; }
+            if (crashed_a != crashed_b) {
+                if (only_one_crash < 6)
+                    printf("ONLY-ONE %#llx case %d: original %s (pc %#llx addr %#llx), lifted %s\n",
+                           (unsigned long long)addr, k, crashed_a ? "crashed" : "ok",
+                           g_fault_pc, g_fault_addr, crashed_b ? "crashed" : "ok");
+                only_one_crash++; bad = 1; break;
+            }
             if (crashed_a) { both_crash++; continue; }
             if (diff_ctx(a, b, why, sizeof why)) {
                 mismatches++; bad = 1; break;

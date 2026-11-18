@@ -41,7 +41,7 @@ static inline uint64_t x64_szp(uint64_t r, unsigned bits)
     if (r == 0) f |= X64_ZF;
     if (r & sign) f |= X64_SF;
     if (!__builtin_parityll(r & 0xff)) f |= X64_PF;
-    return f;
+    return f | 0x2; /* bit 1 of EFLAGS is always 1 and cannot be cleared */
 }
 
 static inline uint64_t x64_add_flags(uint64_t a, uint64_t b, uint64_t r, unsigned bits)
@@ -52,7 +52,7 @@ static inline uint64_t x64_add_flags(uint64_t a, uint64_t b, uint64_t r, unsigne
     if ((r & m) < (a & m)) f |= X64_CF;
     if (((a ^ r) & (b ^ r)) & sign) f |= X64_OF;
     if (((a ^ b ^ r) & 0x10) != 0) f |= X64_AF;
-    return f;
+    return f | 0x2;
 }
 
 static inline uint64_t x64_sub_flags(uint64_t a, uint64_t b, uint64_t r, unsigned bits)
@@ -63,7 +63,7 @@ static inline uint64_t x64_sub_flags(uint64_t a, uint64_t b, uint64_t r, unsigne
     if ((a & m) < (b & m)) f |= X64_CF;
     if (((a ^ b) & (a ^ r)) & sign) f |= X64_OF;
     if (((a ^ b ^ r) & 0x10) != 0) f |= X64_AF;
-    return f;
+    return f | 0x2;
 }
 
 static inline uint64_t x64_logic_flags(uint64_t r, unsigned bits)

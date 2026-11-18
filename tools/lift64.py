@@ -95,11 +95,14 @@ class Lifter:
         self.blocks = None
 
     # ---------------------------------------------------------------- decode
-    def block_at(self, start, end):
-        """Decode one basic block from `start`, stopping after the terminator."""
+    def block_at(self, start, end, starts=frozenset()):
+        """Decode one basic block from `start`, stopping after the terminator or at a known
+        branch target (which begins another block)."""
         out = []
         a = start
         while a < end:
+            if a != start and a in starts:
+                break
             raw = self.pe.read(a, 16)
             if len(raw) < 1:
                 raise Unsupported("read past section")
@@ -118,24 +121,46 @@ class Lifter:
         return out, a
 
     def cfg(self, entry, end):
-        blocks = {}
-        work = [entry]
-        while work:
-            a = work.pop()
-            if a in blocks or not (entry <= a < end):
-                continue
-            insns, nexta = self.block_at(a, end)
-            blocks[a] = insns
-            last = insns[-1]
-            m = last.mnemonic
-            if m == "jmp" and last.operands and last.operands[0].type == X86_OP_IMM:
-                work.append(last.operands[0].imm)
-            elif m != "ret" and m != "jmp":
-                if nexta < end:
-                    work.append(nexta)
-                if m.startswith("j") and last.operands and last.operands[0].type == X86_OP_IMM:
+        """Basic blocks of one function. A branch into the middle of an already decoded block
+        splits it, so every `goto L_x` the lifter emits has a matching label."""
+        self.cur_entry, self.cur_end = entry, end
+        self.last_tails = set()
+        starts = {entry}
+        for _ in range(64):
+            blocks = {}
+            targets = set()
+            work = [entry]
+            while work:
+                a = work.pop()
+                if a in blocks or not (entry <= a < end):
+                    continue
+                insns, nexta = self.block_at(a, end, starts)
+                if not insns:
+                    continue
+                blocks[a] = insns
+                last = insns[-1]
+                m = last.mnemonic
+                if m.endswith(" ret"):
+                    m = "ret"
+                if m == "jmp" and last.operands and last.operands[0].type == X86_OP_IMM:
+                    targets.add(last.operands[0].imm)
                     work.append(last.operands[0].imm)
-        return blocks
+                elif m != "ret" and m != "jmp":
+                    if nexta < end:
+                        targets.add(nexta)
+                        work.append(nexta)
+                    else:
+                        # runs off the end of the .pdata range: the next function's code follows
+                        self.last_tails.add(end)
+                    if m.startswith("j") and last.operands and last.operands[0].type == X86_OP_IMM:
+                        targets.add(last.operands[0].imm)
+                        work.append(last.operands[0].imm)
+            self.last_tails |= {t for t in targets if not (entry <= t < end)}
+            new = {t for t in targets if entry <= t < end} - set(blocks)
+            if not new:
+                return blocks
+            starts |= new
+        raise Unsupported("cfg did not converge")
 
     # ------------------------------------------------------------- operands
     @staticmethod
@@ -174,6 +199,8 @@ class Lifter:
             v = op.imm & ((1 << 64) - 1)
             if v >= 1 << 63:
                 v -= 1 << 64
+            if v == -(1 << 63):
+                return "((uint64_t)(int64_t)(-9223372036854775807LL - 1))"
             return f"((uint64_t)(int64_t){v}LL)"
         if op.type == X86_OP_MEM:
             sz = size or op.size
@@ -207,8 +234,18 @@ class Lifter:
         lines = [f"void f_{entry:x}(X64Ctx *c)", "{"]
         for addr in sorted(blocks):
             lines.append(f"L_{addr:x}:")
-            for ins in blocks[addr]:
+            blk = blocks[addr]
+            for ins in blk:
                 self.emit(lines, ins)
+            last = blk[-1]
+            m = last.mnemonic
+            if m.endswith(" ret"):
+                m = "ret"
+            bend = last.address + last.size
+            if m not in ("ret", "jmp") and not m.startswith("j") and bend >= end:
+                # fall-through into the next function: same contract as a tail call
+                lines.append(f"  f_{end:x}(c);")
+                lines.append("  return;")
         lines.append("  return;")
         lines.append("}")
         return "\n".join(lines)
@@ -304,76 +341,45 @@ class Lifter:
             return
         if m in ("shl", "sal", "shr", "sar", "rol", "ror"):
             bits = size * 8
+            cmask = bits - 1
+            mask = "~0ull" if bits == 64 else f"{(1 << bits) - 1}ULL"
             a = rd(0)
             cnt = rd(1)
-            L.append(f"  {{ uint64_t _a = {a}; unsigned _c = (unsigned)(({cnt}) & 0x3f);")
-            if bits < 64:
-                L.append(f"    uint64_t _m = {(1 << bits) - 1}ULL;")
-                L.append("    _a &= _m;")
+            L.append(f"  {{ uint64_t _a = ({a}) & {mask}; unsigned _c = (unsigned)(({cnt}) & {cmask});")
             L.append("    if (_c) {")
             if m in ("shl", "sal"):
-                L.append("      uint64_t _r = _a << _c;")
-                L.append(f"      if (_c <= {bits}) c->flags = ((_a >> ({bits} - _c)) & 1) ? (c->flags | X64_CF) : (c->flags & ~X64_CF);")
-                L.append("      else c->flags &= ~X64_CF;")
-                L.append(f"      c->flags = (c->flags & ~(X64_ZF|X64_SF|X64_PF)) | x64_szp(_r, {bits});")
-                if bits == 64:
-                    self.write(L, ins, ops[0], "_r")
-                else:
-                    self.write(L, ins, ops[0], f"(_r & _m)")
-                L.append("      goto _done_shift;")
-                L.append("    }")
-                L.append(f"    /* count 0: flags unchanged */")
-                L.append("    _done_shift: ;")
-                L.append("  }")
-                return
-            if m == "shr":
+                L.append(f"      uint64_t _r = (_a << _c) & {mask};")
+                L.append(f"      uint64_t _cf = (_a >> ({bits} - _c)) & 1;")
+                L.append(f"      uint64_t _of = (_c == 1) ? (((_r >> {bits - 1}) & 1) ^ _cf) : 0;")
+            elif m == "shr":
                 L.append("      uint64_t _r = _a >> _c;")
-                L.append(f"      c->flags = ((_a >> (_c - 1)) & 1) ? (c->flags | X64_CF) : (c->flags & ~X64_CF);")
-                L.append(f"      c->flags = (c->flags & ~(X64_ZF|X64_SF|X64_PF)) | x64_szp(_r, {bits});")
-                L.append(f"      c->flags |= ((_a >> {bits - 1}) & 1) ? X64_OF : 0; /* count 1 only; harmless otherwise */")
-                if bits == 64:
-                    self.write(L, ins, ops[0], "_r")
-                else:
-                    self.write(L, ins, ops[0], f"(_r & _m)")
-                L.append("      goto _done_shift;")
-                L.append("    }")
-                L.append("    _done_shift: ;")
-                L.append("  }")
-                return
-            if m == "sar":
+                L.append("      uint64_t _cf = (_a >> (_c - 1)) & 1;")
+                L.append(f"      uint64_t _of = (_c == 1) ? ((_a >> {bits - 1}) & 1) : 0;")
+            elif m == "sar":
                 L.append(f"      int64_t _s = (int64_t)(_a << (64 - {bits})) >> (64 - {bits});")
-                L.append("      int64_t _r = _s >> _c;")
-                L.append(f"      c->flags = ((_a >> (_c - 1)) & 1) ? (c->flags | X64_CF) : (c->flags & ~X64_CF);")
-                L.append(f"      c->flags = (c->flags & ~(X64_ZF|X64_SF|X64_PF)) | x64_szp((uint64_t)_r, {bits});")
-                if bits == 64:
-                    self.write(L, ins, ops[0], "(uint64_t)_r")
-                else:
-                    self.write(L, ins, ops[0], "((uint64_t)_r & _m)")
-                L.append("      goto _done_shift;")
-                L.append("    }")
-                L.append("    _done_shift: ;")
-                L.append("  }")
-                return
-            if m in ("rol", "ror"):
+                L.append(f"      uint64_t _r = (uint64_t)(_s >> _c) & {mask};")
+                L.append("      uint64_t _cf = (_a >> (_c - 1)) & 1;")
+                L.append("      uint64_t _of = 0;")
+            else:  # rol / ror
                 L.append(f"      unsigned _n = _c % {bits};")
                 if m == "rol":
-                    L.append(f"      uint64_t _r = ((_a << _n) | (_a >> ({bits} - _n))) & _m;")
+                    L.append(f"      uint64_t _r = _n ? (((_a << _n) | (_a >> ({bits} - _n))) & {mask}) : _a;")
                 else:
-                    L.append(f"      uint64_t _r = ((_a >> _n) | (_a << ({bits} - _n))) & _m;")
-                L.append("      c->flags = (c->flags & ~(X64_CF|X64_ZF|X64_SF|X64_PF)) | x64_szp(_r, %d);" % bits)
-                L.append(f"      c->flags |= (_r & 1) ? X64_CF : 0;")
-                self.write(L, ins, ops[0], "_r")
-                L.append("      goto _done_shift;")
-                L.append("    }")
-                L.append("    _done_shift: ;")
-                L.append("  }")
-                return
+                    L.append(f"      uint64_t _r = _n ? (((_a >> _n) | (_a << ({bits} - _n))) & {mask}) : _a;")
+                L.append(f"      uint64_t _cf = _r & 1;")
+                L.append("      uint64_t _of = 0;")
+            L.append(f"      c->flags = (c->flags & ~(X64_CF|X64_ZF|X64_SF|X64_PF|X64_OF))"
+                     f" | (_cf ? X64_CF : 0) | (_of ? X64_OF : 0) | x64_szp(_r, {bits});")
+            self.write(L, ins, ops[0], "_r")
+            L.append("    }")
+            L.append("  }")
+            return
         if m == "imul":
             if len(ops) == 1:
                 a = rd(0)
-                L.append(f"  {{ int64_t _p = (int64_t)c->r[0] * (int64_t)({a});")
-                L.append("    c->r[0] = (uint64_t)_p; c->r[2] = (uint64_t)(_p >> 64);")
-                L.append("    c->flags = ((_p >= -0x7fffffffLL && _p <= 0x7fffffffLL) ? 0 : X64_CF) | x64_szp(c->r[0], 64); }")
+                L.append(f"  {{ __int128 _q = (__int128)(int64_t)c->r[0] * (__int128)(int64_t)({a});")
+                L.append("    c->r[0] = (uint64_t)_q; c->r[2] = (uint64_t)(_q >> 64);")
+                L.append("    c->flags = ((_q >= -0x7fffffff && _q <= 0x7fffffff) ? (c->flags & ~(X64_CF|X64_OF)) : (c->flags | X64_CF | X64_OF)) | x64_szp(c->r[0], 64); }")
                 return
             if len(ops) == 2:
                 a, b = rd(0), rd(1)
@@ -457,9 +463,17 @@ class Lifter:
         if m == "jmp":
             if ops[0].type != X86_OP_IMM:
                 raise Unsupported("indirect jmp")
-            L.append(f"  goto L_{ops[0].imm:x};")
+            t = ops[0].imm
+            if self.cur_entry <= t < self.cur_end:
+                L.append(f"  goto L_{t:x};")
+            else:
+                # tail call: the return address of the current frame is already on the guest stack
+                L.append(f"  f_{t:x}(c);")
+                L.append("  return;")
             return
         if m == "ret":
+            # ret pops the return address; the C `return` only transfers control
+            L.append(f"  c->r[{R_SP}] += 8;")
             L.append("  return;")
             return
         if m.startswith("j") and len(m) <= 4 and m not in ("jmp",):
@@ -467,7 +481,11 @@ class Lifter:
             if cc is None:
                 raise Unsupported(m)
             if ops and ops[0].type == X86_OP_IMM:
-                L.append(f"  if (x64_cond(c->flags, {cc})) goto L_{ops[0].imm:x};")
+                t = ops[0].imm
+                if self.cur_entry <= t < self.cur_end:
+                    L.append(f"  if (x64_cond(c->flags, {cc})) goto L_{t:x};")
+                else:
+                    L.append(f"  if (x64_cond(c->flags, {cc})) {{ f_{t:x}(c); return; }}")
                 return
             raise Unsupported("indirect jcc")
         if m == "call":
@@ -511,6 +529,92 @@ class SseMixin:
     pass
 
 
+def emit_conv(self, L, ins, m):
+    """SSE integer/float conversions.
+
+    Only the exact ones are implemented. `cvtps2dq` (round to nearest) is deliberately left
+    unsupported: doing it with a C cast would truncate, which is a different instruction, and
+    the differential test would catch it anyway.
+    """
+    a, b = ins.operands[0], ins.operands[1]
+    if m in ("cvtsi2ss", "cvtsi2sd"):
+        di = self.xmm(a.reg)
+        bits = b.size * 8
+        if b.type == X86_OP_REG:
+            src = self.reg_read(self.md, b.reg)
+        else:
+            src = f"X64_LD{bits}({self.mem_addr(ins, b)})"
+        cast = f"((float)(int64_t){src})" if bits == 64 else f"((float)(int32_t){src})"
+        if m == "cvtsi2sd":
+            cast = cast.replace("(float)", "(double)")
+        L.append(f"  {{ {('double' if m == 'cvtsi2sd' else 'float')} _f = {cast}; memcpy(c->xmm[{di}], &_f, {8 if m == 'cvtsi2sd' else 4}); }}")
+        return True
+    if m in ("cvttss2si", "cvtss2si", "cvttsd2si", "cvtsd2si"):
+        di = reg_info(self.md, a.reg)[0]
+        dst64 = a.size == 8
+        if b.type == X86_OP_REG:
+            si = self.xmm(b.reg)
+            L.append(f"  {{ uint64_t _t[2]; memcpy(_t, c->xmm[{si}], 16);")
+        else:
+            addr = self.mem_addr(ins, b)
+            L.append(f"  {{ uint64_t _t[2]; _t[0] = X64_LD64({addr}); _t[1] = 0;")
+        if m.endswith("sd"):
+            L.append("    double _s; memcpy(&_s, _t, 8);")
+            srcv = "_s"
+        else:
+            L.append("    float _s; memcpy(&_s, _t, 4);")
+            srcv = "_s"
+        # Out of range or NaN yields the "integer indefinite" value, as the hardware does;
+        # a plain C cast would be undefined behaviour there.
+        if dst64:
+            lo, hi, indef = "-9223372036854775808.0", "9223372036854775808.0", "0x8000000000000000ull"
+        else:
+            lo, hi, indef = "-2147483648.0", "2147483648.0", "0x80000000u"
+        L.append(f"    double _d2 = (double){srcv};")
+        L.append(f"    uint64_t _v = (_d2 != _d2 || _d2 >= {hi} || _d2 < {lo}) ? {indef} ")
+        if m.startswith("cvtt"):
+            L.append(f"        : (uint64_t)({'int64_t' if dst64 else 'int32_t'}){srcv};")
+        else:
+            L.append(f"        : (uint64_t)({'int64_t' if dst64 else 'int32_t'})nearbyint({srcv});")
+        L.append(f"    c->r[{di}] = _v; }}")
+        return True
+    if m == "cvtdq2ps":
+        di = self.xmm(a.reg)
+        if b.type == X86_OP_REG:
+            si = self.xmm(b.reg)
+            L.append(f"  {{ v4i _i; memcpy(&_i, c->xmm[{si}], 16); v4f _r = __builtin_convertvector(_i, v4f); memcpy(c->xmm[{di}], &_r, 16); }}")
+        else:
+            addr = self.mem_addr(ins, b)
+            L.append(f"  {{ v4i _i = {{(int32_t)X64_LD32({addr}), (int32_t)X64_LD32({addr} + 4), (int32_t)X64_LD32({addr} + 8), (int32_t)X64_LD32({addr} + 12)}};"
+                     f" v4f _r = __builtin_convertvector(_i, v4f); memcpy(c->xmm[{di}], &_r, 16); }}")
+        return True
+    if m == "cvttps2dq":
+        di = self.xmm(a.reg)
+        if b.type == X86_OP_REG:
+            si = self.xmm(b.reg)
+            L.append(f"  {{ v4f _f; memcpy(&_f, c->xmm[{si}], 16); v4i _r = __builtin_convertvector(_f, v4i); memcpy(c->xmm[{di}], &_r, 16); }}")
+        else:
+            addr = self.mem_addr(ins, b)
+            L.append(f"  {{ v4f _f; _f[0] = X64_LD32({addr}); _f[1] = X64_LD32({addr} + 4);"
+                     f" _f[2] = X64_LD32({addr} + 8); _f[3] = X64_LD32({addr} + 12);"
+                     f" v4i _r = __builtin_convertvector(_f, v4i); memcpy(c->xmm[{di}], &_r, 16); }}")
+        return True
+    if m in ("cvtss2sd", "cvtsd2ss"):
+        di = self.xmm(a.reg)
+        if b.type == X86_OP_REG:
+            si = self.xmm(b.reg)
+            L.append(f"  {{ uint64_t _t[2]; memcpy(_t, c->xmm[{si}], 16);")
+        else:
+            addr = self.mem_addr(ins, b)
+            L.append(f"  {{ uint64_t _t[2]; _t[0] = X64_LD64({addr}); _t[1] = 0;")
+        if m == "cvtss2sd":
+            L.append("    float _s; memcpy(&_s, _t, 4); double _r = (double)_s; memcpy(c->xmm[%d], &_r, 8); }" % di)
+        else:
+            L.append("    double _s; memcpy(&_s, _t, 8); float _r = (float)_s; memcpy(c->xmm[%d], &_r, 4); }" % di)
+        return True
+    return False
+
+
 def emit_sse(self, L, ins):
     m = ins.mnemonic
     ops = ins.operands
@@ -548,13 +652,17 @@ def emit_sse(self, L, ins):
                 return True
             if s2.type == X86_OP_MEM:
                 addr = self.mem_addr(ins, s2)
-                if m in ("movss", "movd"):
-                    L.append(f"  c->xmm[{di}][0] = (c->xmm[{di}][0] & ~0xffffffffULL) | (X64_LD32({addr}) & 0xffffffffULL);" if m == "movss"
-                             else f"  c->xmm[{di}][0] = X64_LD32({addr}); c->xmm[{di}][1] = 0;")
-                elif m in ("movsd", "movq"):
-                    L.append(f"  c->xmm[{di}][0] = X64_LD64({addr});")
-                    if m == "movq":
-                        L.append(f"  c->xmm[{di}][1] = 0;")
+                if m == "movd":
+                    L.append(f"  c->xmm[{di}][0] = X64_LD32({addr}); c->xmm[{di}][1] = 0;")
+                elif m in ("movss", "movsd"):
+                    # MOVSS/MOVSD with a memory source clear the rest of the register;
+                    # with a register source they merge into the low element.
+                    L.append(f"  c->xmm[{di}][0] = X64_LD{32 if m == 'movss' else 64}({addr});")
+                    if m == "movss":
+                        L.append(f"  c->xmm[{di}][0] &= 0xffffffffULL;")
+                    L.append(f"  c->xmm[{di}][1] = 0;")
+                elif m == "movq":
+                    L.append(f"  c->xmm[{di}][0] = X64_LD64({addr}); c->xmm[{di}][1] = 0;")
                 else:
                     L.append(f"  c->xmm[{di}][0] = X64_LD64({addr}); c->xmm[{di}][1] = X64_LD64({addr} + 8);")
                 return True
@@ -579,9 +687,9 @@ def emit_sse(self, L, ins):
         else:
             addr = self.mem_addr(ins, ops[1])
             if m in SCALAR:
-                L.append(f"  {{ v4u _s; memset(&_s, 0, sizeof _s); _s[0] = X64_LD32({addr}); v4u _d; memcpy(&_d, c->xmm[{di}], 16);")
+                L.append(f"  {{ v4u _s; memset(&_s, 0, sizeof _s); memcpy(&_s, (const void *)(uintptr_t)({addr}), 4); v4u _d; memcpy(&_d, c->xmm[{di}], 16);")
             else:
-                L.append(f"  {{ v4u _s; _s[0] = X64_LD64({addr}); _s[1] = X64_LD64({addr} + 8); _s[2] = 0; _s[3] = 0; v4u _d; memcpy(&_d, c->xmm[{di}], 16);")
+                L.append(f"  {{ v4u _s; memcpy(&_s, (const void *)(uintptr_t)({addr}), 16); v4u _d; memcpy(&_d, c->xmm[{di}], 16);")
         if m in ("addps", "addss"):
             L.append("    v4f _r = *(v4f*)&_d + *(v4f*)&_s;")
         elif m in ("subps", "subss"):
@@ -591,11 +699,8 @@ def emit_sse(self, L, ins):
         elif m in ("divps", "divss"):
             L.append("    v4f _r = *(v4f*)&_d / *(v4f*)&_s;")
         elif m in ("addpd", "addsd", "subpd", "subsd", "mulpd", "mulsd", "divpd", "divsd"):
-            op = m[:3]
-            L.append(f"    v2d _r = *(v2d*)&_d {op[0]} *(v2d*)&_s;" if op == "add" else
-                     f"    v2d _r = *(v2d*)&_d - *(v2d*)&_s;" if op == "sub" else
-                     f"    v2d _r = *(v2d*)&_d * *(v2d*)&_s;" if op == "mul" else
-                     f"    v2d _r = *(v2d*)&_d / *(v2d*)&_s;")
+            opsym = {"add": "+", "sub": "-", "mul": "*", "div": "/"}[m[:3]]
+            L.append(f"    v2d _r = *(v2d*)&_d {opsym} *(v2d*)&_s;")
         elif m.startswith("xor"):
             L.append("    v4u _r = _d ^ _s;")
         elif m.startswith("andn"):
@@ -609,9 +714,10 @@ def emit_sse(self, L, ins):
         if m in SCALAR or m in ("addsd", "subsd", "mulsd", "divsd"):
             if m in ("addss", "subss", "mulss", "divss", "addsd", "subsd", "mulsd", "divsd"):
                 if m.endswith("ss"):
-                    L.append(f"    _d[0] = ((v4u*)&_r)[0]; memcpy(c->xmm[{di}], _d, 16);")
+                    L.append(f"    _d[0] = ((uint32_t*)&_r)[0]; memcpy(c->xmm[{di}], &_d, 16);")
                 else:
-                    L.append(f"    _d[0] = ((v4u*)&_r)[0]; _d[1] = ((v4u*)&_r)[1]; memcpy(c->xmm[{di}], _d, 16);")
+                    # scalar double: only the low lane changes, the rest is the destination
+                    L.append(f"    _d[0] = ((uint64_t*)&_r)[0]; memcpy(c->xmm[{di}], &_d, 16);")
                 L.append("  }")
                 return True
         L.append(f"    memcpy(c->xmm[{di}], &_r, 16); }}")
@@ -623,7 +729,7 @@ def emit_sse(self, L, ins):
             L.append(f"  {{ v4u _a; memcpy(&_a, c->xmm[{di}], 16); v4u _b; memcpy(&_b, c->xmm[{si}], 16);")
         else:
             addr = self.mem_addr(ins, ops[1])
-            L.append(f"  {{ v4u _a; memcpy(&_a, c->xmm[{di}], 16); v4u _b = {{X64_LD64({addr}), X64_LD64({addr}+8), 0, 0}};")
+            L.append(f"  {{ v4u _a; memcpy(&_a, c->xmm[{di}], 16); v4u _b; memcpy(&_b, (const void *)(uintptr_t)({addr}), 16);")
         if m == "unpcklps":
             L.append("    v4u _r = {_a[0], _b[0], _a[1], _b[1]};")
         elif m == "unpckhps":
@@ -641,7 +747,7 @@ def emit_sse(self, L, ins):
             L.append(f"  {{ v4u _a; memcpy(&_a, c->xmm[{di}], 16); v4u _b; memcpy(&_b, c->xmm[{si}], 16);")
         else:
             addr = self.mem_addr(ins, ops[1])
-            L.append(f"  {{ v4u _a; memcpy(&_a, c->xmm[{di}], 16); v4u _b = {{X64_LD64({addr}), X64_LD64({addr}+8), 0, 0}};")
+            L.append(f"  {{ v4u _a; memcpy(&_a, c->xmm[{di}], 16); v4u _b; memcpy(&_b, (const void *)(uintptr_t)({addr}), 16);")
         imm = ops[2].imm
         L.append(f"    v4u _r = {{_a[{imm & 3}], _a[{(imm >> 2) & 3}], _b[{(imm >> 4) & 3}], _b[{(imm >> 6) & 3}]}};")
         L.append(f"    memcpy(c->xmm[{di}], &_r, 16); }}")
@@ -653,7 +759,7 @@ def emit_sse(self, L, ins):
             L.append(f"  {{ v4u _a; memcpy(&_a, c->xmm[{si}], 16);")
         else:
             addr = self.mem_addr(ins, ops[1])
-            L.append(f"  {{ v4u _a = {{X64_LD64({addr}), X64_LD64({addr}+8), 0, 0}};")
+            L.append(f"  {{ v4u _a; memcpy(&_a, (const void *)(uintptr_t)({addr}), 16);")
         imm = ops[2].imm
         L.append(f"    v4u _r = {{_a[{imm & 3}], _a[{(imm >> 2) & 3}], _a[{(imm >> 4) & 3}], _a[{(imm >> 6) & 3}]}};")
         L.append(f"    memcpy(c->xmm[{di}], &_r, 16); }}")
@@ -667,21 +773,68 @@ def emit_sse(self, L, ins):
                 L.append(f"  {{ v4u _s; memcpy(&_s, c->xmm[{si}], 16);")
             else:
                 addr = self.mem_addr(ins, ops[1])
-                L.append(f"  {{ v4u _s = {{X64_LD64({addr}), X64_LD64({addr}+8), 0, 0}};")
+                L.append(f"  {{ v4u _s; memcpy(&_s, (const void *)(uintptr_t)({addr}), 16);")
             L.append(f"    v4u _d; memcpy(&_d, c->xmm[{di}], 16);")
             if scalar:
-                L.append("    float _a = *(float*)&_d[0], _b = *(float*)&_s[0];")
+                L.append("    float _a, _b; memcpy(&_a, &_d, 4); memcpy(&_b, &_s, 4);")
                 L.append("    c->flags = (!(_a == _a) || !(_b == _b)) ? (X64_ZF|X64_PF|X64_CF) : ((_a < _b) ? X64_CF : ((_a == _b) ? X64_ZF : 0));")
             else:
-                L.append("    double _a = *(double*)&_d[0], _b = *(double*)&_s[0];")
+                L.append("    double _a, _b; memcpy(&_a, &_d, 8); memcpy(&_b, &_s, 8);")
                 L.append("    c->flags = (!(_a == _a) || !(_b == _b)) ? (X64_ZF|X64_PF|X64_CF) : ((_a < _b) ? X64_CF : ((_a == _b) ? X64_ZF : 0));")
             L.append("  }")
             return True
         # cmpps/cmpsd aliases: capstone prints e.g. cmpltps
         raise Unsupported(m)
     if m in CONV:
+        return emit_conv(self, L, ins, m)
+    if m in ("minss", "maxss", "minsd", "maxsd"):
+        # x86 MINSS/MAXSS: if either operand is NaN the *source* wins, which is exactly
+        # what `(a < b) ? a : b` does (a NaN comparison is false).
+        di = self.xmm(ops[0].reg)
+        dbl = m.endswith("sd")
+        sz = 8 if dbl else 4
+        ty = "double" if dbl else "float"
+        if ops[1].type == X86_OP_REG:
+            si = self.xmm(ops[1].reg)
+            L.append(f"  {{ uint64_t _t[2]; memcpy(_t, c->xmm[{si}], 16);")
+        else:
+            addr = self.mem_addr(ins, ops[1])
+            L.append(f"  {{ uint64_t _t[2]; _t[0] = X64_LD64({addr}); _t[1] = 0;")
+        cmp = "<" if m.startswith("min") else ">"
+        L.append(f"    {ty} _a, _b; memcpy(&_a, c->xmm[{di}], {sz}); memcpy(&_b, _t, {sz});")
+        L.append(f"    {ty} _r = (_a {cmp} _b) ? _a : _b; memcpy(c->xmm[{di}], &_r, {sz}); }}")
         return True
-    if m in ("minss", "maxss", "minsd", "maxsd", "sqrtss", "sqrtsd", "sqrtps", "sqrtpd"):
+    if m in ("sqrtss", "sqrtsd"):
+        di = self.xmm(ops[0].reg)
+        dbl = m.endswith("sd")
+        sz = 8 if dbl else 4
+        ty = "double" if dbl else "float"
+        fn = "__builtin_sqrt" if dbl else "__builtin_sqrtf"
+        if ops[1].type == X86_OP_REG:
+            si = self.xmm(ops[1].reg)
+            L.append(f"  {{ uint64_t _t[2]; memcpy(_t, c->xmm[{si}], 16);")
+        else:
+            addr = self.mem_addr(ins, ops[1])
+            L.append(f"  {{ uint64_t _t[2]; _t[0] = X64_LD64({addr}); _t[1] = 0;")
+        L.append(f"    {ty} _s; memcpy(&_s, _t, {sz}); {ty} _r = {fn}(_s); memcpy(c->xmm[{di}], &_r, {sz}); }}")
+        return True
+    if m in ("sqrtps", "sqrtpd"):
+        di = self.xmm(ops[0].reg)
+        dbl = m.endswith("pd")
+        n = 2 if dbl else 4
+        sz = 8 if dbl else 4
+        ty = "double" if dbl else "float"
+        fn = "__builtin_sqrt" if dbl else "__builtin_sqrtf"
+        if ops[1].type == X86_OP_REG:
+            si = self.xmm(ops[1].reg)
+            L.append(f"  {{ uint64_t _t[2]; memcpy(_t, c->xmm[{si}], 16);")
+        else:
+            addr = self.mem_addr(ins, ops[1])
+            L.append(f"  {{ uint64_t _t[2]; _t[0] = X64_LD64({addr}); _t[1] = X64_LD64({addr} + 8);")
+        L.append(f"    {ty} _r[{n}];")
+        for k in range(n):
+            L.append(f"    {{ {ty} _s; memcpy(&_s, (char*)_t + {k * sz}, {sz}); _r[{k}] = {fn}(_s); }}")
+        L.append(f"    memcpy(c->xmm[{di}], _r, 16); }}")
         return True
     return False
 
