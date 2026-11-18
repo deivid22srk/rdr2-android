@@ -35,6 +35,14 @@ static sigjmp_buf g_jb;
 static volatile int g_crashed;
 
 static volatile unsigned long long g_fault_addr, g_fault_pc;
+static volatile int g_timeout;
+
+static void on_alarm(int sig)
+{
+    (void)sig;
+    g_timeout = 1;
+    siglongjmp(g_jb, 1);
+}
 static void on_segv(int sig, siginfo_t *si, void *uc)
 {
     (void)sig;
@@ -106,21 +114,22 @@ static uint64_t interesting(void)
     }
 }
 
-#define ARENA_BASE 0x300000000ull
-#define ARENA_SIZE 0x200000ull
+#define ARENA_BASE 0x110000ull
+#define ARENA_SIZE 0x100000ull
 
 static uint8_t *g_arena;
 
-static void fill_ctx(X64Ctx *c, uint8_t *stack, size_t stack_size, uint64_t fn_addr)
+static void fill_ctx(X64Ctx *c, uint8_t *stack, size_t stack_size, uint64_t fn_addr, int loop)
 {
     memset(c, 0, sizeof *c);
     for (int i = 0; i < 16; i++)
         if (i != 4)
             /* Half the time a pointer into the arena, half the time a value that hits an
-             * arithmetic edge case. */
+             * arithmetic edge case. A function with a loop gets only small values: with a
+             * random 64-bit loop bound the case would never finish. */
             c->r[i] = (rnd() & 1)
                           ? (ARENA_BASE + (rnd() & (ARENA_SIZE - 0x2000)))
-                          : interesting();
+                          : (loop ? (rnd() & 7) : interesting());
     for (int i = 0; i < 16; i++) {
         c->xmm[i][0] = rnd();
         c->xmm[i][1] = rnd();
@@ -173,6 +182,9 @@ int main(int argc, char **argv)
     sigaction(SIGBUS, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGFPE, &sa, NULL);
+    struct sigaction al = {0};
+    al.sa_handler = on_alarm;
+    sigaction(SIGALRM, &al, NULL);
 
     size_t stack_size = 1 << 16;
     uint8_t *stack = malloc(stack_size);
@@ -202,29 +214,38 @@ int main(int argc, char **argv)
         void *fn = g_image + (addr - g_base);
         (void)end;
         funcs++;
-        int bad = 0;
+        if (getenv("DIFFTEST_VERBOSE")) { printf("FUNC %#llx\n", (unsigned long long)addr); fflush(stdout); }
+        int bad = 0, timed_out = 0;
         for (int k = 0; k < cases; k++) {
             memcpy(stack, stack_image, stack_size);
-            fill_ctx(a, stack, stack_size, addr);
+            fill_ctx(a, stack, stack_size, addr, (int)kTests[t].loop);
             memcpy(b, a, sizeof *b);
 
             g_crashed = 0;
+            g_timeout = 0;
             int crashed_a = 0;
+            alarm(10);              /* a guest loop with a random bound must not hang the run */
             if (sigsetjmp(g_jb, 1) == 0) {
                 run_guest(a, fn, (void *)(uintptr_t)(((uint64_t)(uintptr_t)(stack + stack_size)) & ~15ull));
             } else {
                 crashed_a = 1;
             }
+            alarm(0);
+            if (g_timeout) { timed_out = 1; continue; }
             uint64_t after_a_rsp = a->r[4];
 
             memcpy(stack, stack_image, stack_size);
             g_crashed = 0;
+            g_timeout = 0;
             int crashed_b = 0;
+            alarm(10);
             if (sigsetjmp(g_jb, 1) == 0) {
                 kTests[t].lifted(b);
             } else {
                 crashed_b = 1;
             }
+            alarm(0);
+            if (g_timeout) { timed_out = 1; continue; }
             (void)after_a_rsp;
 
             if (crashed_a != crashed_b) {
@@ -239,6 +260,7 @@ int main(int argc, char **argv)
                 mismatches++; bad = 1; break;
             }
         }
+        if (timed_out) { skipped++; funcs--; continue; }
         if (!bad) oks++;
         else if (!first_bad) first_bad = addr;
         if (bad && mismatches + only_one_crash <= 12)

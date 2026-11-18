@@ -23,8 +23,8 @@ extern uint64_t guest_done_addr;
 
 #define STACK_BASE 0x200000000ull
 #define STACK_SIZE 0x20000ull
-#define ARENA_BASE 0x300000000ull
-#define ARENA_SIZE 0x200000ull
+#define ARENA_BASE 0x110000ull
+#define ARENA_SIZE 0x100000ull
 
 static sigjmp_buf jb;
 static volatile int crashed;

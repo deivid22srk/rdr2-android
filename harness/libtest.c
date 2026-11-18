@@ -23,8 +23,8 @@
 
 #define STACK_BASE 0x200000000ull
 #define STACK_SIZE 0x20000ull
-#define ARENA_BASE 0x300000000ull
-#define ARENA_SIZE 0x200000ull
+#define ARENA_BASE 0x110000ull
+#define ARENA_SIZE 0x100000ull
 
 static sigjmp_buf g_jb;
 static volatile int g_crashed;
@@ -98,7 +98,7 @@ int main(int argc, char **argv)
             for (int i = 0; i < 16; i++)
                 if (i != 4)
                     c.r[i] = (rnd() & 1) ? (ARENA_BASE + (rnd() & (ARENA_SIZE - 0x2000)))
-                                         : interesting();
+                                         : (kTests[t].loop ? (rnd() & 7) : interesting());
             for (int i = 0; i < 16; i++) { c.xmm[i][0] = rnd(); c.xmm[i][1] = rnd(); }
             c.flags = 0x202 | (rnd() & (X64_CF | X64_PF | X64_AF | X64_ZF | X64_SF | X64_OF));
             *(uint64_t *)(uintptr_t)(top - 8) = 0;
