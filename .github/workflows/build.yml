@@ -114,7 +114,13 @@ jobs:
             echo "::error::build full sem gen/ — o codegen não foi baixado"; exit 1
           fi
 
+      # The wrapper jar is the one from the older ports in this account; it is not in
+      # Gradle's checksum database. The distribution itself is pinned by URL in
+      # gradle/wrapper/gradle-wrapper.properties (8.1.1), so validation is turned off
+      # rather than replacing the jar with a downloaded copy.
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          validate-wrappers: false
 
       - name: Build APK
         env:
